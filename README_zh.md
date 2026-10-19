@@ -13,6 +13,13 @@ Google Antigravity 本地菜单栏上下文容量与 Token 监控工具。
 
 ## 效果预览
 
+<p align="center">
+  <img src="assets/demo.gif" alt="agy-menubar demo" width="680" />
+</p>
+
+<details>
+<summary><b>点击展开菜单项文本结构对照</b></summary>
+
 ```text
 Mac 顶部状态栏:
 [◎ 104.2k]  Tue Oct 19 14:50
@@ -43,6 +50,8 @@ Mac 顶部状态栏:
 │ 退出                                       ⌘Q │
 └──────────────────────────────────────────────┘
 ```
+
+</details>
 
 ---
 

@@ -13,6 +13,13 @@ Native macOS menu bar context window and token usage monitor for Google Antigrav
 
 ## Preview
 
+<p align="center">
+  <img src="assets/demo.gif" alt="agy-menubar demo" width="680" />
+</p>
+
+<details>
+<summary><b>Click to expand text menu layout</b></summary>
+
 ```text
 macOS Menu Bar:
 [◎ 104.2k]  Tue Oct 19 14:50
@@ -43,6 +50,8 @@ Dropdown Menu:
 │ Quit                                      ⌘Q │
 └──────────────────────────────────────────────┘
 ```
+
+</details>
 
 ---
 
