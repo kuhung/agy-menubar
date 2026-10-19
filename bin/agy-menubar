@@ -7,9 +7,8 @@ https://github.com/kuhung/agy-menubar
 Licensed under the MIT License.
 """
 
-import sys
 import os
-import glob
+import re
 import json
 import sqlite3
 import argparse
@@ -20,7 +19,9 @@ from Foundation import (
     NSRunLoop,
     NSMakeSize,
     NSMakeRect,
-    NSMakePoint
+    NSMakePoint,
+    NSAttributedString,
+    NSMutableAttributedString
 )
 from AppKit import (
     NSApplication,
@@ -33,14 +34,40 @@ from AppKit import (
     NSImage,
     NSBezierPath,
     NSColor,
+    NSFont,
+    NSFontAttributeName,
+    NSForegroundColorAttributeName,
     NSPasteboard,
     NSPasteboardTypeString
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 DB_PATH = os.path.expanduser("~/.gemini/antigravity/conversation_summaries.db")
 BRAIN_DIR = os.path.expanduser("~/.gemini/antigravity/brain")
+
+MODEL_CHANGE_RE = re.compile(
+    r"changed setting `Model Selection` from .*? to (.+?)\. No need to comment"
+)
+
+
+def infer_context_limit(model_name):
+    """Infers the context window limit based on the active model name."""
+    if not model_name:
+        return 1000000
+    low = model_name.lower()
+    if "claude" in low:
+        return 200000
+    if "gpt-oss" in low or "gpt-4" in low:
+        return 128000
+    return 1000000
+
+
+def format_limit_short(limit):
+    if limit >= 1000000:
+        return f"{limit // 1000000}M"
+    return f"{limit // 1000}k"
+
 
 def create_ring_icon(percent):
     """Draws a crisp Retina-ready circular progress ring matching macOS menu bar styling."""
@@ -79,6 +106,33 @@ def create_ring_icon(percent):
     img.unlockFocus()
     return img
 
+
+def make_kv_attributed_string(label, value, value_color=None):
+    """Creates a cleanly aligned monospaced key-value NSAttributedString for NSMenuItem."""
+    mono_font = NSFont.monospacedSystemFontOfSize_weight_(12.0, 0.0)
+    bold_mono_font = NSFont.monospacedSystemFontOfSize_weight_(12.0, 0.25)
+
+    label_padded = f"{label:<15}"
+    result = NSMutableAttributedString.alloc().init()
+
+    label_attrs = {
+        NSFontAttributeName: mono_font,
+        NSForegroundColorAttributeName: NSColor.secondaryLabelColor()
+    }
+    val_attrs = {
+        NSFontAttributeName: bold_mono_font,
+        NSForegroundColorAttributeName: value_color or NSColor.labelColor()
+    }
+
+    result.appendAttributedString_(
+        NSAttributedString.alloc().initWithString_attributes_(label_padded, label_attrs)
+    )
+    result.appendAttributedString_(
+        NSAttributedString.alloc().initWithString_attributes_(value, val_attrs)
+    )
+    return result
+
+
 class AntigravityMenuBarApp(NSObject):
     def init(self):
         self = objc.super(AntigravityMenuBarApp, self).init()
@@ -88,8 +142,12 @@ class AntigravityMenuBarApp(NSObject):
         self.menu = None
         self.timer = None
         self.pinned_convo_id = None
+        self.pinned_convo_title = None
         self.current_stats = None
         self.recent_conversations = []
+        self.is_menu_open = False
+        self.last_signature = None
+        self.last_icon_bucket = None
         return self
 
     def applicationDidFinishLaunching_(self, notification):
@@ -98,23 +156,33 @@ class AntigravityMenuBarApp(NSObject):
 
         self.status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
         self.menu = NSMenu.alloc().init()
+        self.menu.setDelegate_(self)
         self.status_item.setMenu_(self.menu)
 
-        # Set initial icon & title
-        self.status_item.button().setImage_(create_ring_icon(0))
-        self.status_item.button().setTitle_(" --")
+        # Use monospaced digits on status bar button to prevent width jitter
+        btn = self.status_item.button()
+        btn.setFont_(NSFont.monospacedDigitSystemFontOfSize_weight_(12.5, 0.0))
+        btn.setImage_(create_ring_icon(0))
+        btn.setTitle_(" --")
 
         # Initial refresh
-        self.refreshData()
+        self.refreshData(force=True)
 
-        # Setup persistent timer in Common Modes (runs even during menu open / window dragging)
+        # Setup persistent timer in Common Modes
         self.timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
             1.5, self, "onTimerTick:", None, True
         )
         NSRunLoop.currentRunLoop().addTimer_forMode_(self.timer, "kCFRunLoopCommonModes")
 
+    def menuWillOpen_(self, menu):
+        self.is_menu_open = True
+        self.refreshData(force=True, rebuild_menu_now=True)
+
+    def menuDidClose_(self, menu):
+        self.is_menu_open = False
+
     def onTimerTick_(self, timer):
-        self.refreshData()
+        self.refreshData(force=False)
 
     @objc.python_method
     def fetchRecentConversations(self):
@@ -128,7 +196,7 @@ class AntigravityMenuBarApp(NSObject):
                 SELECT conversation_id, title, last_modified_time, step_count 
                 FROM conversation_summaries 
                 ORDER BY last_modified_time DESC 
-                LIMIT 6
+                LIMIT 8
             """)
             for row in cur.fetchall():
                 convos.append({
@@ -137,6 +205,17 @@ class AntigravityMenuBarApp(NSObject):
                     "mtime": row[2],
                     "step_count": row[3]
                 })
+
+            # If pinned conversation is not in top 8, fetch its title directly
+            if self.pinned_convo_id and not any(c["id"] == self.pinned_convo_id for c in convos):
+                cur.execute(
+                    "SELECT title FROM conversation_summaries WHERE conversation_id = ?",
+                    (self.pinned_convo_id,)
+                )
+                prow = cur.fetchone()
+                if prow and prow[0]:
+                    self.pinned_convo_title = prow[0]
+
             conn.close()
         except Exception:
             pass
@@ -149,16 +228,26 @@ class AntigravityMenuBarApp(NSObject):
             return None
 
         last_model_step = None
+        active_model = "Gemini 3.8 Flash"
         total_steps = 0
+
         try:
             with open(transcript_file, "r", encoding="utf-8") as f:
                 for line in f:
-                    if line.strip():
-                        total_steps += 1
+                    if not line.strip():
+                        continue
+                    total_steps += 1
+                    # Fast pre-filter before full JSON parsing when scanning
+                    if '"input_tokens"' in line or "Model Selection" in line:
                         try:
                             s = json.loads(line)
                             if s.get("source") == "MODEL" and "input_tokens" in s:
                                 last_model_step = s
+                            elif s.get("type") == "USER_INPUT":
+                                content = s.get("content", "")
+                                m = MODEL_CHANGE_RE.search(content)
+                                if m:
+                                    active_model = m.group(1).strip()
                         except Exception:
                             pass
         except Exception:
@@ -169,7 +258,7 @@ class AntigravityMenuBarApp(NSObject):
             cache = last_model_step.get("cache_read_tokens", 0)
             out = last_model_step.get("output_tokens", 0)
             total = inp + cache
-            limit = 1000000
+            limit = infer_context_limit(active_model)
             pct = round(total / limit * 100, 1)
             return {
                 "convo_id": convo_id,
@@ -179,13 +268,14 @@ class AntigravityMenuBarApp(NSObject):
                 "output_tokens": out,
                 "total_tokens": total,
                 "total_steps": total_steps,
+                "model": active_model,
                 "limit": limit,
                 "percent": pct
             }
         return None
 
     @objc.python_method
-    def refreshData(self):
+    def refreshData(self, force=False, rebuild_menu_now=False):
         convos = self.fetchRecentConversations()
         self.recent_conversations = convos
 
@@ -194,29 +284,56 @@ class AntigravityMenuBarApp(NSObject):
 
         if self.pinned_convo_id:
             target_convo_id = self.pinned_convo_id
+            target_title = self.pinned_convo_title or self.pinned_convo_id[:12]
             for c in convos:
                 if c["id"] == self.pinned_convo_id:
                     target_title = c["title"]
+                    self.pinned_convo_title = target_title
                     break
         elif convos:
             target_convo_id = convos[0]["id"]
             target_title = convos[0]["title"]
 
-        stats = None
+        # Check file stat fingerprint to avoid redundant parsing & UI redraws when idle
+        t_mtime = 0
+        t_size = 0
         if target_convo_id:
+            t_file = os.path.join(BRAIN_DIR, target_convo_id, ".system_generated", "logs", "transcript.jsonl")
+            try:
+                st = os.stat(t_file)
+                t_mtime = st.st_mtime_ns
+                t_size = st.st_size
+            except OSError:
+                pass
+
+        convos_sig = tuple((c["id"], c["title"], c["step_count"]) for c in convos)
+        signature = (target_convo_id, self.pinned_convo_id, t_mtime, t_size, convos_sig)
+
+        if not force and signature == self.last_signature:
+            return
+
+        self.last_signature = signature
+
+        stats = None
+        if target_convo_id and t_size > 0:
             stats = self.parseTranscript(target_convo_id)
             if stats:
                 stats["title"] = target_title
 
         self.current_stats = stats
         self.updateStatusBarDisplay(stats)
-        self.rebuildMenu(stats, convos)
+
+        # Do not destroy/rebuild menu while user is actively browsing an open menu/submenu
+        # unless triggered directly by menuWillOpen_ or a user click action
+        if not self.is_menu_open or rebuild_menu_now:
+            self.rebuildMenu(stats, convos)
 
     @objc.python_method
     def updateStatusBarDisplay(self, stats):
         if not stats:
             self.status_item.button().setImage_(create_ring_icon(0))
             self.status_item.button().setTitle_(" --")
+            self.last_icon_bucket = 0
             return
 
         pct = stats["percent"]
@@ -226,8 +343,12 @@ class AntigravityMenuBarApp(NSObject):
         else:
             token_str = f" {total/1000:.1f}k"
 
-        # Update Retina ring icon & clean numeric text
-        self.status_item.button().setImage_(create_ring_icon(pct))
+        # Redraw ring icon only when visual bucket changes (every 0.5%)
+        icon_bucket = int(round(pct * 2))
+        if icon_bucket != self.last_icon_bucket:
+            self.status_item.button().setImage_(create_ring_icon(pct))
+            self.last_icon_bucket = icon_bucket
+
         self.status_item.button().setTitle_(token_str)
 
     @objc.python_method
@@ -237,10 +358,16 @@ class AntigravityMenuBarApp(NSObject):
         # Section 1: Active Conversation Header
         if stats:
             title_text = stats["title"]
-            if len(title_text) > 28:
-                title_text = title_text[:27] + "…"
-            header_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                f"{title_text}", None, ""
+            if len(title_text) > 30:
+                title_text = title_text[:29] + "…"
+
+            header_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("", None, "")
+            header_attrs = {
+                NSFontAttributeName: NSFont.boldSystemFontOfSize_(13.0),
+                NSForegroundColorAttributeName: NSColor.labelColor()
+            }
+            header_item.setAttributedTitle_(
+                NSAttributedString.alloc().initWithString_attributes_(title_text, header_attrs)
             )
             header_item.setEnabled_(False)
             self.menu.addItem_(header_item)
@@ -248,42 +375,38 @@ class AntigravityMenuBarApp(NSObject):
             # ASCII Progress Bar
             pct = stats["percent"]
             bar_len = 12
-            filled_len = int(round(bar_len * pct / 100))
+            filled_len = min(max(int(round(bar_len * pct / 100)), 0), bar_len)
             bar_str = "■" * filled_len + "□" * (bar_len - filled_len)
-            progress_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                f"[{bar_str}]  {pct:.1f}% ({stats['total_tokens']:,} / 1M)", None, ""
+            limit_short = format_limit_short(stats["limit"])
+            progress_str = f"[{bar_str}] {pct:.1f}% ({stats['total_tokens']:,} / {limit_short})"
+
+            progress_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("", None, "")
+            prog_attrs = {
+                NSFontAttributeName: NSFont.monospacedSystemFontOfSize_weight_(11.5, 0.0),
+                NSForegroundColorAttributeName: NSColor.secondaryLabelColor()
+            }
+            progress_item.setAttributedTitle_(
+                NSAttributedString.alloc().initWithString_attributes_(progress_str, prog_attrs)
             )
             progress_item.setEnabled_(False)
             self.menu.addItem_(progress_item)
 
             self.menu.addItem_(NSMenuItem.separatorItem())
 
-            # Section 2: Detailed Token Breakdown
-            cache_pct = round(stats['cache_tokens'] / max(stats['total_tokens'], 1) * 100, 1)
-            item_cache = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                f"Prompt Cache    {stats['cache_tokens']:,}  ({cache_pct}%)", None, ""
-            )
-            item_cache.setEnabled_(False)
-            self.menu.addItem_(item_cache)
-
-            item_inp = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                f"New Turn Input  {stats['input_tokens']:,}", None, ""
-            )
-            item_inp.setEnabled_(False)
-            self.menu.addItem_(item_inp)
-
-            free_tokens = max(stats['limit'] - stats['total_tokens'], 0)
-            item_free = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                f"Headroom Left   {free_tokens:,}  ({100 - pct:.1f}%)", None, ""
-            )
-            item_free.setEnabled_(False)
-            self.menu.addItem_(item_free)
-
-            item_model = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                f"Active Model    Gemini 3.8 Flash (High)", None, ""
-            )
-            item_model.setEnabled_(False)
-            self.menu.addItem_(item_model)
+            # Section 2: Detailed Token Breakdown (Crisp Monospaced Key-Value)
+            cache_pct = round(stats["cache_tokens"] / max(stats["total_tokens"], 1) * 100, 1)
+            for label, val, color in [
+                ("Prompt Cache", f"{stats['cache_tokens']:,} ({cache_pct}%)", None),
+                ("Turn Input", f"{stats['input_tokens']:,}", None),
+                ("Last Output", f"{stats['output_tokens']:,}", None),
+                ("Headroom Left", f"{max(stats['limit'] - stats['total_tokens'], 0):,} ({max(100.0 - pct, 0.0):.1f}%)", NSColor.systemGreenColor() if pct < 60 else None),
+                ("Total Steps", f"{stats['total_steps']}", None),
+                ("Active Model", f"{stats['model']}", None),
+            ]:
+                row_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("", None, "")
+                row_item.setAttributedTitle_(make_kv_attributed_string(label, val, color))
+                row_item.setEnabled_(False)
+                self.menu.addItem_(row_item)
         else:
             no_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                 "暂无活跃 Antigravity 对话", None, ""
@@ -315,8 +438,8 @@ class AntigravityMenuBarApp(NSObject):
         for idx, c in enumerate(convos):
             cid = c["id"]
             ctitle = c["title"] if c["title"] else cid[:12]
-            if len(ctitle) > 24:
-                ctitle = ctitle[:23] + "…"
+            if len(ctitle) > 26:
+                ctitle = ctitle[:25] + "…"
             c_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                 ctitle, "selectConvo:", ""
             )
@@ -355,12 +478,17 @@ class AntigravityMenuBarApp(NSObject):
 
     def selectAutoTrack_(self, sender):
         self.pinned_convo_id = None
-        self.refreshData()
+        self.pinned_convo_title = None
+        self.refreshData(force=True, rebuild_menu_now=True)
 
     def selectConvo_(self, sender):
         cid = sender.representedObject()
         self.pinned_convo_id = cid
-        self.refreshData()
+        for c in self.recent_conversations:
+            if c["id"] == cid:
+                self.pinned_convo_title = c["title"]
+                break
+        self.refreshData(force=True, rebuild_menu_now=True)
 
     def copyConvoId_(self, sender):
         if self.current_stats and "convo_id" in self.current_stats:
@@ -374,10 +502,11 @@ class AntigravityMenuBarApp(NSObject):
             NSWorkspace.sharedWorkspace().openFile_(folder)
 
     def manualRefresh_(self, sender):
-        self.refreshData()
+        self.refreshData(force=True, rebuild_menu_now=True)
 
     def terminateApp_(self, sender):
         NSApp.terminate_(self)
+
 
 def main():
     parser = argparse.ArgumentParser(description="agy-menubar: macOS Menu Bar Monitor for Antigravity")
@@ -388,6 +517,7 @@ def main():
     delegate = AntigravityMenuBarApp.alloc().init()
     app.setDelegate_(delegate)
     app.run()
+
 
 if __name__ == "__main__":
     main()

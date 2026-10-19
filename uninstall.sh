@@ -8,7 +8,6 @@ set -euo pipefail
 
 BOLD="\033[1m"
 GREEN="\033[32m"
-RED="\033[31m"
 RESET="\033[0m"
 
 echo -e "${BOLD}Uninstalling agy-menubar...${RESET}"
@@ -24,8 +23,8 @@ if [[ -f "${PLIST_FILE}" ]]; then
     echo "Removed LaunchAgent plist."
 fi
 
-# Kill running processes
-pkill -f "agy-menubar" 2>/dev/null || true
+# Kill running python daemon processes without killing this script itself
+pkill -f "[p]ython.*agy-menubar" 2>/dev/null || true
 
 # Remove binary
 if [[ -f "${TARGET_BIN}" ]]; then

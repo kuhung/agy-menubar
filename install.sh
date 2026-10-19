@@ -33,11 +33,13 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
+PYTHON_BIN="$(command -v python3)"
+
 # 3. PyObjC / AppKit check
-echo -e "Checking Python AppKit bindings..."
-if ! python3 -c "import AppKit" >/dev/null 2>&1; then
+echo -e "Checking Python AppKit bindings (${PYTHON_BIN})..."
+if ! "${PYTHON_BIN}" -c "import AppKit" >/dev/null 2>&1; then
     echo -e "${YELLOW}PyObjC AppKit is not installed. Installing pyobjc-framework-Cocoa...${RESET}"
-    python3 -m pip install --quiet pyobjc-framework-Cocoa
+    "${PYTHON_BIN}" -m pip install --quiet pyobjc-framework-Cocoa
 fi
 echo -e "${GREEN}✓ Python & AppKit dependencies verified.${RESET}"
 
@@ -51,7 +53,10 @@ mkdir -p "${INSTALL_DIR}"
 mkdir -p "${PLIST_DIR}"
 
 # 5. Binary installation (from local git repo or remote download)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
+SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
+fi
 
 if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/bin/agy-menubar" ]]; then
     echo -e "Installing binary from local repository..."
@@ -67,11 +72,16 @@ echo -e "${GREEN}✓ Binary installed to ${TARGET_BIN}${RESET}"
 # 6. Configure LaunchAgent for autostart
 echo -e "Configuring background LaunchAgent daemon..."
 
-# Unload previous service if running
+# Unload previous service if running (only match python processes, never the installer script itself)
 launchctl unload "${PLIST_FILE}" >/dev/null 2>&1 || true
-pkill -f "${TARGET_BIN}" >/dev/null 2>&1 || true
+pkill -f "[p]ython.*agy-menubar" >/dev/null 2>&1 || true
 
-cat <<EOF > "${PLIST_FILE}"
+if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/launchd/com.kuhung.agy-menubar.plist" ]]; then
+    sed -e "s|__PYTHON_BIN__|${PYTHON_BIN}|g" \
+        -e "s|__BIN_PATH__|${TARGET_BIN}|g" \
+        "${SCRIPT_DIR}/launchd/com.kuhung.agy-menubar.plist" > "${PLIST_FILE}"
+else
+    cat <<EOF > "${PLIST_FILE}"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -80,6 +90,7 @@ cat <<EOF > "${PLIST_FILE}"
     <string>com.kuhung.agy-menubar</string>
     <key>ProgramArguments</key>
     <array>
+        <string>${PYTHON_BIN}</string>
         <string>${TARGET_BIN}</string>
     </array>
     <key>RunAtLoad</key>
@@ -93,6 +104,7 @@ cat <<EOF > "${PLIST_FILE}"
 </dict>
 </plist>
 EOF
+fi
 
 # Load and start daemon
 launchctl load "${PLIST_FILE}"
