@@ -57,16 +57,20 @@ Dropdown Menu:
 
 ## Why agy-menubar
 
-During extended coding sessions or agent tasks in Antigravity, the interface does not show current token consumption or remaining context headroom. Long conversations can degrade or slow down before the user notices that running `/compact` is necessary.
+During extended coding sessions or agent tasks in Antigravity, the interface does not show current token consumption or remaining context headroom. Long conversations degrade in latency and attention before users realize running `/compact` is necessary.
 
-`agy-menubar` stays in the macOS status bar, reads local session records, and presents token usage and cache ratios directly in the menu bar.
+While underlying models like Gemini Flash theoretically support 1M+ tokens, Antigravity's agent runtime automatically triggers a checkpoint compaction around **~220k tokens** (and reasoning degradation starts creeping in around ~150k). If measured against 1M, the progress ring would sit at an uninformative 22% (green) right before auto-compaction wipes the context.
+
+`agy-menubar` stays in the macOS status bar, calibrates context saturation against the **~220k operational compaction watermark**, transitions colors intuitively, and surfaces proactive compaction advice.
 
 ---
 
 ## Features
 
-- **Dynamic Progress Ring**: Draws an 18×18 vector arc via CoreGraphics directly in the menu bar, transitioning from green to orange and red based on context saturation.
-- **Detailed Token Breakdown**: Displays prompt cache volume, turn input, previous output, remaining headroom, and total steps.
+- **Dynamic Progress Ring & Warnings**: Draws an 18×18 vector arc via CoreGraphics directly in the menu bar with green (<60%), orange (60%–85%, recommending `/compact`), and red (≥85%, compaction imminent) visual states.
+- **Actionable Compaction Banners**: Surfaces `💡 Consider running /compact` or `🚨 Near ~220k auto-compaction line` directly in the menu and hover tooltips.
+- **Detailed Token Breakdown**: Displays prompt cache volume, turn input, previous output, remaining headroom to compaction, and total steps.
+- **Custom Watermark**: Calibrated to 220k by default; customizable via `--limit <TOKENS>` or the `AGY_CONTEXT_LIMIT` environment variable.
 - **Bilingual Interface**: Automatically matches macOS system language, allows switching between English and Simplified Chinese at runtime, and accepts `--lang {auto,zh,en}` from the command line.
 - **Session Auto-Tracking**: Automatically follows the most recent active conversation, or lets you pin a specific conversation from the submenu.
 - **Shortcuts**: Includes keyboard shortcuts to copy conversation IDs, reveal logs in Finder, refresh, and quit.
@@ -108,11 +112,11 @@ Run directly in the foreground for testing:
 ./bin/agy-menubar
 ```
 
-Specify interface language:
+Specify interface language or custom context watermark:
 
 ```bash
 ./bin/agy-menubar --lang en
-./bin/agy-menubar --lang zh
+./bin/agy-menubar --limit 200000
 ```
 
 ---

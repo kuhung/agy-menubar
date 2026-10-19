@@ -44,7 +44,7 @@ from AppKit import (
     NSPasteboardTypeString
 )
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 DB_PATH = os.path.expanduser("~/.gemini/antigravity/conversation_summaries.db")
 BRAIN_DIR = os.path.expanduser("~/.gemini/antigravity/brain")
@@ -70,6 +70,8 @@ STRINGS = {
         "label_headroom": "剩余空间",
         "label_total_steps": "执行步数",
         "label_active_model": "当前模型",
+        "hint_compact_suggested": "💡 建议执行 /compact 压缩上下文",
+        "hint_compact_imminent": "🚨 接近 ~220k 自动压缩水位线",
     },
     "en": {
         "untitled_convo": "Untitled Conversation",
@@ -91,6 +93,8 @@ STRINGS = {
         "label_headroom": "Headroom Left",
         "label_total_steps": "Total Steps",
         "label_active_model": "Active Model",
+        "hint_compact_suggested": "💡 Consider running /compact to optimize context",
+        "hint_compact_imminent": "🚨 Near ~220k auto-compaction line, run /compact",
     }
 }
 
@@ -110,16 +114,30 @@ MODEL_CHANGE_RE = re.compile(
 )
 
 
-def infer_context_limit(model_name):
-    """Infers the context window limit based on the active model name."""
+def infer_context_limit(model_name, custom_limit=None):
+    """
+    Infers the operational context limit based on the active model.
+
+    Note: While Gemini Flash/Pro models theoretically support 1M+ tokens, Antigravity's
+    agent runtime triggers an automatic Checkpoint compaction around ~220k tokens
+    to prevent latency spikes and reasoning drift. agy-menubar uses this operational
+    watermark (220k) so the progress ring and warnings give actionable compaction alerts.
+    """
+    if custom_limit and custom_limit > 0:
+        return custom_limit
+
+    env_limit = os.environ.get("AGY_CONTEXT_LIMIT")
+    if env_limit and env_limit.isdigit():
+        return int(env_limit)
+
     if not model_name:
-        return 1000000
+        return 220000
     low = model_name.lower()
     if "claude" in low:
         return 200000
     if "gpt-oss" in low or "gpt-4" in low:
         return 128000
-    return 1000000
+    return 220000
 
 
 def format_limit_short(limit):
@@ -208,6 +226,7 @@ class AntigravityMenuBarApp(NSObject):
         self.last_signature = None
         self.last_icon_bucket = None
         self.lang_mode = "auto"
+        self.custom_limit = None
         try:
             saved_lang = NSUserDefaults.standardUserDefaults().stringForKey_("agy_language")
             if saved_lang in ("auto", "zh", "en"):
@@ -341,7 +360,7 @@ class AntigravityMenuBarApp(NSObject):
             cache = last_model_step.get("cache_read_tokens", 0)
             out = last_model_step.get("output_tokens", 0)
             total = inp + cache
-            limit = infer_context_limit(active_model)
+            limit = infer_context_limit(active_model, self.custom_limit)
             pct = round(total / limit * 100, 1)
             return {
                 "convo_id": convo_id,
@@ -416,6 +435,7 @@ class AntigravityMenuBarApp(NSObject):
         if not stats:
             self.status_item.button().setImage_(create_ring_icon(0))
             self.status_item.button().setTitle_(" --")
+            self.status_item.button().setToolTip_(self.t("no_active_dialog"))
             self.last_icon_bucket = 0
             return
 
@@ -433,6 +453,15 @@ class AntigravityMenuBarApp(NSObject):
             self.last_icon_bucket = icon_bucket
 
         self.status_item.button().setTitle_(token_str)
+
+        # Hover tooltip with actionable context information
+        limit_short = format_limit_short(stats["limit"])
+        tip = f"Antigravity: {stats['total_tokens']:,} / {limit_short} ({pct:.1f}%)\n{self.t('label_active_model')}: {stats['model']}"
+        if pct >= 85.0:
+            tip += f"\n{self.t('hint_compact_imminent')}"
+        elif pct >= 65.0:
+            tip += f"\n{self.t('hint_compact_suggested')}"
+        self.status_item.button().setToolTip_(tip)
 
     @objc.python_method
     def rebuildMenu(self, stats, convos):
@@ -474,15 +503,43 @@ class AntigravityMenuBarApp(NSObject):
             progress_item.setEnabled_(False)
             self.menu.addItem_(progress_item)
 
+            # Proactive compaction hint banner
+            if pct >= 85.0:
+                hint_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("", None, "")
+                hint_attrs = {
+                    NSFontAttributeName: NSFont.systemFontOfSize_weight_(11.5, 0.25),
+                    NSForegroundColorAttributeName: NSColor.systemRedColor()
+                }
+                hint_item.setAttributedTitle_(
+                    NSAttributedString.alloc().initWithString_attributes_(self.t("hint_compact_imminent"), hint_attrs)
+                )
+                hint_item.setEnabled_(False)
+                self.menu.addItem_(hint_item)
+            elif pct >= 65.0:
+                hint_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("", None, "")
+                hint_attrs = {
+                    NSFontAttributeName: NSFont.systemFontOfSize_weight_(11.5, 0.0),
+                    NSForegroundColorAttributeName: NSColor.systemOrangeColor()
+                }
+                hint_item.setAttributedTitle_(
+                    NSAttributedString.alloc().initWithString_attributes_(self.t("hint_compact_suggested"), hint_attrs)
+                )
+                hint_item.setEnabled_(False)
+                self.menu.addItem_(hint_item)
+
             self.menu.addItem_(NSMenuItem.separatorItem())
 
             # Section 2: Detailed Token Breakdown (Crisp Monospaced Key-Value)
             cache_pct = round(stats["cache_tokens"] / max(stats["total_tokens"], 1) * 100, 1)
+            headroom_color = (
+                NSColor.systemRedColor() if pct >= 85.0
+                else (NSColor.systemOrangeColor() if pct >= 60.0 else NSColor.systemGreenColor())
+            )
             for label, val, color in [
                 (self.t("label_prompt_cache"), f"{stats['cache_tokens']:,} ({cache_pct}%)", None),
                 (self.t("label_turn_input"), f"{stats['input_tokens']:,}", None),
                 (self.t("label_last_output"), f"{stats['output_tokens']:,}", None),
-                (self.t("label_headroom"), f"{max(stats['limit'] - stats['total_tokens'], 0):,} ({max(100.0 - pct, 0.0):.1f}%)", NSColor.systemGreenColor() if pct < 60 else None),
+                (self.t("label_headroom"), f"{max(stats['limit'] - stats['total_tokens'], 0):,} ({max(100.0 - pct, 0.0):.1f}%)", headroom_color),
                 (self.t("label_total_steps"), f"{stats['total_steps']}", None),
                 (self.t("label_active_model"), f"{stats['model']}", None),
             ]:
@@ -628,12 +685,20 @@ def main():
         default=None,
         help="Interface language (auto, zh, en)",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Custom context window limit (default: 220000 operational watermark)",
+    )
     args = parser.parse_args()
 
     app = NSApplication.sharedApplication()
     delegate = AntigravityMenuBarApp.alloc().init()
     if args.lang:
         delegate.lang_mode = args.lang
+    if args.limit:
+        delegate.custom_limit = args.limit
     app.setDelegate_(delegate)
     app.run()
 
