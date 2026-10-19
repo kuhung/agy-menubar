@@ -117,6 +117,6 @@ if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then
     echo -e "  export PATH=\"${INSTALL_DIR}:\$PATH\""
 fi
 
-echo -e "\n${GREEN}${BOLD}🎉 agy-menubar installed and running successfully!${RESET}"
-echo -e "Look at your top macOS menu bar — you should see the dynamic ring icon."
-echo -e "To uninstall anytime, simply run: ${CYAN}uninstall.sh${RESET}\n"
+echo -e "\n${GREEN}${BOLD}agy-menubar installed and running successfully.${RESET}"
+echo -e "Look at your macOS menu bar to see the status item."
+echo -e "To uninstall, run: ${CYAN}uninstall.sh${RESET}\n"

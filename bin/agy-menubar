@@ -12,6 +12,7 @@ import re
 import json
 import sqlite3
 import argparse
+import unicodedata
 import objc
 from Foundation import (
     NSObject,
@@ -21,7 +22,9 @@ from Foundation import (
     NSMakeRect,
     NSMakePoint,
     NSAttributedString,
-    NSMutableAttributedString
+    NSMutableAttributedString,
+    NSLocale,
+    NSUserDefaults
 )
 from AppKit import (
     NSApplication,
@@ -41,10 +44,66 @@ from AppKit import (
     NSPasteboardTypeString
 )
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 DB_PATH = os.path.expanduser("~/.gemini/antigravity/conversation_summaries.db")
 BRAIN_DIR = os.path.expanduser("~/.gemini/antigravity/brain")
+
+STRINGS = {
+    "zh": {
+        "untitled_convo": "未命名会话",
+        "no_active_convo": "无活跃会话",
+        "no_active_dialog": "暂无活跃 Antigravity 对话",
+        "switch_convo": "切换跟踪会话",
+        "auto_track": "自动跟踪最新活跃会话",
+        "copy_convo_id": "复制会话 ID",
+        "open_finder": "在 Finder 中打开日志",
+        "refresh_now": "立即刷新",
+        "language_menu": "语言 / Language",
+        "lang_auto": "跟随系统 (Auto)",
+        "lang_zh": "简体中文",
+        "lang_en": "English",
+        "quit": "退出",
+        "label_prompt_cache": "提示词缓存",
+        "label_turn_input": "本轮输入",
+        "label_last_output": "上轮输出",
+        "label_headroom": "剩余空间",
+        "label_total_steps": "执行步数",
+        "label_active_model": "当前模型",
+    },
+    "en": {
+        "untitled_convo": "Untitled Conversation",
+        "no_active_convo": "No Active Conversation",
+        "no_active_dialog": "No active Antigravity conversations",
+        "switch_convo": "Switch Conversation",
+        "auto_track": "Auto-track latest active session",
+        "copy_convo_id": "Copy Conversation ID",
+        "open_finder": "Reveal Logs in Finder",
+        "refresh_now": "Refresh Now",
+        "language_menu": "Language / 语言",
+        "lang_auto": "System Default (Auto)",
+        "lang_zh": "简体中文",
+        "lang_en": "English",
+        "quit": "Quit",
+        "label_prompt_cache": "Prompt Cache",
+        "label_turn_input": "Turn Input",
+        "label_last_output": "Last Output",
+        "label_headroom": "Headroom Left",
+        "label_total_steps": "Total Steps",
+        "label_active_model": "Active Model",
+    }
+}
+
+
+def str_display_width(s):
+    """Calculates terminal/monospaced visual width taking CJK characters into account."""
+    return sum(2 if unicodedata.east_asian_width(c) in ("F", "W") else 1 for c in s)
+
+
+def pad_label(label, target_width=16):
+    """Pads string to target visual width for clean column alignment."""
+    w = str_display_width(label)
+    return label + (" " * max(0, target_width - w))
 
 MODEL_CHANGE_RE = re.compile(
     r"changed setting `Model Selection` from .*? to (.+?)\. No need to comment"
@@ -112,7 +171,7 @@ def make_kv_attributed_string(label, value, value_color=None):
     mono_font = NSFont.monospacedSystemFontOfSize_weight_(12.0, 0.0)
     bold_mono_font = NSFont.monospacedSystemFontOfSize_weight_(12.0, 0.25)
 
-    label_padded = f"{label:<15}"
+    label_padded = pad_label(label, 16)
     result = NSMutableAttributedString.alloc().init()
 
     label_attrs = {
@@ -148,7 +207,31 @@ class AntigravityMenuBarApp(NSObject):
         self.is_menu_open = False
         self.last_signature = None
         self.last_icon_bucket = None
+        self.lang_mode = "auto"
+        try:
+            saved_lang = NSUserDefaults.standardUserDefaults().stringForKey_("agy_language")
+            if saved_lang in ("auto", "zh", "en"):
+                self.lang_mode = str(saved_lang)
+        except Exception:
+            pass
         return self
+
+    @objc.python_method
+    def get_effective_lang(self):
+        if self.lang_mode in ("zh", "en"):
+            return self.lang_mode
+        try:
+            pref = NSLocale.preferredLanguages()
+            if pref and str(pref[0]).lower().startswith("zh"):
+                return "zh"
+        except Exception:
+            pass
+        return "en"
+
+    @objc.python_method
+    def t(self, key):
+        lang = self.get_effective_lang()
+        return STRINGS.get(lang, STRINGS["en"]).get(key, key)
 
     def applicationDidFinishLaunching_(self, notification):
         # Set accessory mode (no Dock icon)
@@ -201,7 +284,7 @@ class AntigravityMenuBarApp(NSObject):
             for row in cur.fetchall():
                 convos.append({
                     "id": row[0],
-                    "title": row[1] if row[1] else "未命名会话",
+                    "title": row[1] if row[1] else self.t("untitled_convo"),
                     "mtime": row[2],
                     "step_count": row[3]
                 })
@@ -280,7 +363,7 @@ class AntigravityMenuBarApp(NSObject):
         self.recent_conversations = convos
 
         target_convo_id = None
-        target_title = "无活跃会话"
+        target_title = self.t("no_active_convo")
 
         if self.pinned_convo_id:
             target_convo_id = self.pinned_convo_id
@@ -307,7 +390,7 @@ class AntigravityMenuBarApp(NSObject):
                 pass
 
         convos_sig = tuple((c["id"], c["title"], c["step_count"]) for c in convos)
-        signature = (target_convo_id, self.pinned_convo_id, t_mtime, t_size, convos_sig)
+        signature = (target_convo_id, self.pinned_convo_id, t_mtime, t_size, self.get_effective_lang(), convos_sig)
 
         if not force and signature == self.last_signature:
             return
@@ -396,12 +479,12 @@ class AntigravityMenuBarApp(NSObject):
             # Section 2: Detailed Token Breakdown (Crisp Monospaced Key-Value)
             cache_pct = round(stats["cache_tokens"] / max(stats["total_tokens"], 1) * 100, 1)
             for label, val, color in [
-                ("Prompt Cache", f"{stats['cache_tokens']:,} ({cache_pct}%)", None),
-                ("Turn Input", f"{stats['input_tokens']:,}", None),
-                ("Last Output", f"{stats['output_tokens']:,}", None),
-                ("Headroom Left", f"{max(stats['limit'] - stats['total_tokens'], 0):,} ({max(100.0 - pct, 0.0):.1f}%)", NSColor.systemGreenColor() if pct < 60 else None),
-                ("Total Steps", f"{stats['total_steps']}", None),
-                ("Active Model", f"{stats['model']}", None),
+                (self.t("label_prompt_cache"), f"{stats['cache_tokens']:,} ({cache_pct}%)", None),
+                (self.t("label_turn_input"), f"{stats['input_tokens']:,}", None),
+                (self.t("label_last_output"), f"{stats['output_tokens']:,}", None),
+                (self.t("label_headroom"), f"{max(stats['limit'] - stats['total_tokens'], 0):,} ({max(100.0 - pct, 0.0):.1f}%)", NSColor.systemGreenColor() if pct < 60 else None),
+                (self.t("label_total_steps"), f"{stats['total_steps']}", None),
+                (self.t("label_active_model"), f"{stats['model']}", None),
             ]:
                 row_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("", None, "")
                 row_item.setAttributedTitle_(make_kv_attributed_string(label, val, color))
@@ -409,7 +492,7 @@ class AntigravityMenuBarApp(NSObject):
                 self.menu.addItem_(row_item)
         else:
             no_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "暂无活跃 Antigravity 对话", None, ""
+                self.t("no_active_dialog"), None, ""
             )
             no_item.setEnabled_(False)
             self.menu.addItem_(no_item)
@@ -419,14 +502,14 @@ class AntigravityMenuBarApp(NSObject):
         # Section 3: Switch / Pin Conversation Submenu
         switch_menu = NSMenu.alloc().init()
         switch_parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "切换跟踪会话", None, ""
+            self.t("switch_convo"), None, ""
         )
         switch_parent.setSubmenu_(switch_menu)
         self.menu.addItem_(switch_parent)
 
         # Option: Auto-track latest
         auto_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "自动跟踪最新活跃会话", "selectAutoTrack:", ""
+            self.t("auto_track"), "selectAutoTrack:", ""
         )
         auto_item.setTarget_(self)
         if self.pinned_convo_id is None:
@@ -451,27 +534,45 @@ class AntigravityMenuBarApp(NSObject):
 
         # Section 4: Quick Actions
         item_copy = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "复制会话 ID", "copyConvoId:", "c"
+            self.t("copy_convo_id"), "copyConvoId:", "c"
         )
         item_copy.setTarget_(self)
         self.menu.addItem_(item_copy)
 
         item_finder = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "在 Finder 中打开日志", "openFinder:", "o"
+            self.t("open_finder"), "openFinder:", "o"
         )
         item_finder.setTarget_(self)
         self.menu.addItem_(item_finder)
 
         item_refresh = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "立即刷新", "manualRefresh:", "r"
+            self.t("refresh_now"), "manualRefresh:", "r"
         )
         item_refresh.setTarget_(self)
         self.menu.addItem_(item_refresh)
 
+        # Section 5: Language Selection Submenu
+        lang_menu = NSMenu.alloc().init()
+        lang_parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            self.t("language_menu"), None, ""
+        )
+        lang_parent.setSubmenu_(lang_menu)
+        self.menu.addItem_(lang_parent)
+
+        for mode_code, title_key in [("auto", "lang_auto"), ("zh", "lang_zh"), ("en", "lang_en")]:
+            l_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                self.t(title_key), "selectLanguage:", ""
+            )
+            l_item.setRepresentedObject_(mode_code)
+            l_item.setTarget_(self)
+            if self.lang_mode == mode_code:
+                l_item.setState_(1)
+            lang_menu.addItem_(l_item)
+
         self.menu.addItem_(NSMenuItem.separatorItem())
 
         item_quit = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "退出", "terminateApp:", "q"
+            self.t("quit"), "terminateApp:", "q"
         )
         item_quit.setTarget_(self)
         self.menu.addItem_(item_quit)
@@ -489,6 +590,16 @@ class AntigravityMenuBarApp(NSObject):
                 self.pinned_convo_title = c["title"]
                 break
         self.refreshData(force=True, rebuild_menu_now=True)
+
+    def selectLanguage_(self, sender):
+        mode = sender.representedObject()
+        if mode in ("auto", "zh", "en"):
+            self.lang_mode = mode
+            try:
+                NSUserDefaults.standardUserDefaults().setObject_forKey_(mode, "agy_language")
+            except Exception:
+                pass
+            self.refreshData(force=True, rebuild_menu_now=True)
 
     def copyConvoId_(self, sender):
         if self.current_stats and "convo_id" in self.current_stats:
@@ -511,10 +622,18 @@ class AntigravityMenuBarApp(NSObject):
 def main():
     parser = argparse.ArgumentParser(description="agy-menubar: macOS Menu Bar Monitor for Antigravity")
     parser.add_argument("--version", "-v", action="version", version=f"agy-menubar {__version__}")
-    parser.parse_args()
+    parser.add_argument(
+        "--lang",
+        choices=["auto", "zh", "en"],
+        default=None,
+        help="Interface language (auto, zh, en)",
+    )
+    args = parser.parse_args()
 
     app = NSApplication.sharedApplication()
     delegate = AntigravityMenuBarApp.alloc().init()
+    if args.lang:
+        delegate.lang_mode = args.lang
     app.setDelegate_(delegate)
     app.run()
 
