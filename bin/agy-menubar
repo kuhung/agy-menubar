@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+agy-menubar: Minimalist macOS Menu Bar Context Monitor for Google Antigravity.
+https://github.com/kuhung/agy-menubar
+
+Licensed under the MIT License.
+"""
+
+import sys
+import os
+import glob
+import json
+import sqlite3
+import argparse
+import objc
+from Foundation import (
+    NSObject,
+    NSTimer,
+    NSRunLoop,
+    NSMakeSize,
+    NSMakeRect,
+    NSMakePoint
+)
+from AppKit import (
+    NSApplication,
+    NSApp,
+    NSStatusBar,
+    NSVariableStatusItemLength,
+    NSMenu,
+    NSMenuItem,
+    NSWorkspace,
+    NSImage,
+    NSBezierPath,
+    NSColor,
+    NSPasteboard,
+    NSPasteboardTypeString
+)
+
+__version__ = "0.1.0"
+
+DB_PATH = os.path.expanduser("~/.gemini/antigravity/conversation_summaries.db")
+BRAIN_DIR = os.path.expanduser("~/.gemini/antigravity/brain")
+
+def create_ring_icon(percent):
+    """Draws a crisp Retina-ready circular progress ring matching macOS menu bar styling."""
+    size = NSMakeSize(18, 18)
+    img = NSImage.alloc().initWithSize_(size)
+    img.lockFocus()
+
+    rect = NSMakeRect(2.5, 2.5, 13.0, 13.0)
+    center = NSMakePoint(9.0, 9.0)
+    radius = 6.5
+
+    # Background track (muted grey ring)
+    bg_path = NSBezierPath.bezierPathWithOvalInRect_(rect)
+    bg_path.setLineWidth_(2.0)
+    NSColor.colorWithWhite_alpha_(0.5, 0.28).setStroke()
+    bg_path.stroke()
+
+    # Progress arc
+    if percent > 0.05:
+        arc_path = NSBezierPath.bezierPath()
+        arc_path.setLineWidth_(2.0)
+        start_angle = 90.0
+        clamped_pct = min(max(percent, 0.0), 100.0)
+        end_angle = 90.0 - (clamped_pct * 360.0 / 100.0)
+        arc_path.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise_(
+            center, radius, start_angle, end_angle, True
+        )
+        if clamped_pct < 60.0:
+            NSColor.systemGreenColor().setStroke()
+        elif clamped_pct < 85.0:
+            NSColor.systemOrangeColor().setStroke()
+        else:
+            NSColor.systemRedColor().setStroke()
+        arc_path.stroke()
+
+    img.unlockFocus()
+    return img
+
+class AntigravityMenuBarApp(NSObject):
+    def init(self):
+        self = objc.super(AntigravityMenuBarApp, self).init()
+        if self is None:
+            return None
+        self.status_item = None
+        self.menu = None
+        self.timer = None
+        self.pinned_convo_id = None
+        self.current_stats = None
+        self.recent_conversations = []
+        return self
+
+    def applicationDidFinishLaunching_(self, notification):
+        # Set accessory mode (no Dock icon)
+        NSApp.setActivationPolicy_(2)
+
+        self.status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
+        self.menu = NSMenu.alloc().init()
+        self.status_item.setMenu_(self.menu)
+
+        # Set initial icon & title
+        self.status_item.button().setImage_(create_ring_icon(0))
+        self.status_item.button().setTitle_(" --")
+
+        # Initial refresh
+        self.refreshData()
+
+        # Setup persistent timer in Common Modes (runs even during menu open / window dragging)
+        self.timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+            1.5, self, "onTimerTick:", None, True
+        )
+        NSRunLoop.currentRunLoop().addTimer_forMode_(self.timer, "kCFRunLoopCommonModes")
+
+    def onTimerTick_(self, timer):
+        self.refreshData()
+
+    @objc.python_method
+    def fetchRecentConversations(self):
+        convos = []
+        if not os.path.exists(DB_PATH):
+            return convos
+        try:
+            conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=1.0)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT conversation_id, title, last_modified_time, step_count 
+                FROM conversation_summaries 
+                ORDER BY last_modified_time DESC 
+                LIMIT 6
+            """)
+            for row in cur.fetchall():
+                convos.append({
+                    "id": row[0],
+                    "title": row[1] if row[1] else "未命名会话",
+                    "mtime": row[2],
+                    "step_count": row[3]
+                })
+            conn.close()
+        except Exception:
+            pass
+        return convos
+
+    @objc.python_method
+    def parseTranscript(self, convo_id):
+        transcript_file = os.path.join(BRAIN_DIR, convo_id, ".system_generated", "logs", "transcript.jsonl")
+        if not os.path.exists(transcript_file):
+            return None
+
+        last_model_step = None
+        total_steps = 0
+        try:
+            with open(transcript_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        total_steps += 1
+                        try:
+                            s = json.loads(line)
+                            if s.get("source") == "MODEL" and "input_tokens" in s:
+                                last_model_step = s
+                        except Exception:
+                            pass
+        except Exception:
+            return None
+
+        if last_model_step:
+            inp = last_model_step.get("input_tokens", 0)
+            cache = last_model_step.get("cache_read_tokens", 0)
+            out = last_model_step.get("output_tokens", 0)
+            total = inp + cache
+            limit = 1000000
+            pct = round(total / limit * 100, 1)
+            return {
+                "convo_id": convo_id,
+                "file": transcript_file,
+                "input_tokens": inp,
+                "cache_tokens": cache,
+                "output_tokens": out,
+                "total_tokens": total,
+                "total_steps": total_steps,
+                "limit": limit,
+                "percent": pct
+            }
+        return None
+
+    @objc.python_method
+    def refreshData(self):
+        convos = self.fetchRecentConversations()
+        self.recent_conversations = convos
+
+        target_convo_id = None
+        target_title = "无活跃会话"
+
+        if self.pinned_convo_id:
+            target_convo_id = self.pinned_convo_id
+            for c in convos:
+                if c["id"] == self.pinned_convo_id:
+                    target_title = c["title"]
+                    break
+        elif convos:
+            target_convo_id = convos[0]["id"]
+            target_title = convos[0]["title"]
+
+        stats = None
+        if target_convo_id:
+            stats = self.parseTranscript(target_convo_id)
+            if stats:
+                stats["title"] = target_title
+
+        self.current_stats = stats
+        self.updateStatusBarDisplay(stats)
+        self.rebuildMenu(stats, convos)
+
+    @objc.python_method
+    def updateStatusBarDisplay(self, stats):
+        if not stats:
+            self.status_item.button().setImage_(create_ring_icon(0))
+            self.status_item.button().setTitle_(" --")
+            return
+
+        pct = stats["percent"]
+        total = stats["total_tokens"]
+        if total >= 1000000:
+            token_str = f" {total/1000000:.2f}M"
+        else:
+            token_str = f" {total/1000:.1f}k"
+
+        # Update Retina ring icon & clean numeric text
+        self.status_item.button().setImage_(create_ring_icon(pct))
+        self.status_item.button().setTitle_(token_str)
+
+    @objc.python_method
+    def rebuildMenu(self, stats, convos):
+        self.menu.removeAllItems()
+
+        # Section 1: Active Conversation Header
+        if stats:
+            title_text = stats["title"]
+            if len(title_text) > 28:
+                title_text = title_text[:27] + "…"
+            header_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                f"{title_text}", None, ""
+            )
+            header_item.setEnabled_(False)
+            self.menu.addItem_(header_item)
+
+            # ASCII Progress Bar
+            pct = stats["percent"]
+            bar_len = 12
+            filled_len = int(round(bar_len * pct / 100))
+            bar_str = "■" * filled_len + "□" * (bar_len - filled_len)
+            progress_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                f"[{bar_str}]  {pct:.1f}% ({stats['total_tokens']:,} / 1M)", None, ""
+            )
+            progress_item.setEnabled_(False)
+            self.menu.addItem_(progress_item)
+
+            self.menu.addItem_(NSMenuItem.separatorItem())
+
+            # Section 2: Detailed Token Breakdown
+            cache_pct = round(stats['cache_tokens'] / max(stats['total_tokens'], 1) * 100, 1)
+            item_cache = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                f"Prompt Cache    {stats['cache_tokens']:,}  ({cache_pct}%)", None, ""
+            )
+            item_cache.setEnabled_(False)
+            self.menu.addItem_(item_cache)
+
+            item_inp = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                f"New Turn Input  {stats['input_tokens']:,}", None, ""
+            )
+            item_inp.setEnabled_(False)
+            self.menu.addItem_(item_inp)
+
+            free_tokens = max(stats['limit'] - stats['total_tokens'], 0)
+            item_free = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                f"Headroom Left   {free_tokens:,}  ({100 - pct:.1f}%)", None, ""
+            )
+            item_free.setEnabled_(False)
+            self.menu.addItem_(item_free)
+
+            item_model = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                f"Active Model    Gemini 3.8 Flash (High)", None, ""
+            )
+            item_model.setEnabled_(False)
+            self.menu.addItem_(item_model)
+        else:
+            no_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "暂无活跃 Antigravity 对话", None, ""
+            )
+            no_item.setEnabled_(False)
+            self.menu.addItem_(no_item)
+
+        self.menu.addItem_(NSMenuItem.separatorItem())
+
+        # Section 3: Switch / Pin Conversation Submenu
+        switch_menu = NSMenu.alloc().init()
+        switch_parent = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "切换跟踪会话", None, ""
+        )
+        switch_parent.setSubmenu_(switch_menu)
+        self.menu.addItem_(switch_parent)
+
+        # Option: Auto-track latest
+        auto_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "自动跟踪最新活跃会话", "selectAutoTrack:", ""
+        )
+        auto_item.setTarget_(self)
+        if self.pinned_convo_id is None:
+            auto_item.setState_(1)  # Checked
+        switch_menu.addItem_(auto_item)
+        switch_menu.addItem_(NSMenuItem.separatorItem())
+
+        # List individual recent conversations
+        for idx, c in enumerate(convos):
+            cid = c["id"]
+            ctitle = c["title"] if c["title"] else cid[:12]
+            if len(ctitle) > 24:
+                ctitle = ctitle[:23] + "…"
+            c_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                ctitle, "selectConvo:", ""
+            )
+            c_item.setRepresentedObject_(cid)
+            c_item.setTarget_(self)
+            if self.pinned_convo_id == cid or (self.pinned_convo_id is None and idx == 0):
+                c_item.setState_(1)  # Checked
+            switch_menu.addItem_(c_item)
+
+        # Section 4: Quick Actions
+        item_copy = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "复制会话 ID", "copyConvoId:", "c"
+        )
+        item_copy.setTarget_(self)
+        self.menu.addItem_(item_copy)
+
+        item_finder = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "在 Finder 中打开日志", "openFinder:", "o"
+        )
+        item_finder.setTarget_(self)
+        self.menu.addItem_(item_finder)
+
+        item_refresh = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "立即刷新", "manualRefresh:", "r"
+        )
+        item_refresh.setTarget_(self)
+        self.menu.addItem_(item_refresh)
+
+        self.menu.addItem_(NSMenuItem.separatorItem())
+
+        item_quit = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "退出", "terminateApp:", "q"
+        )
+        item_quit.setTarget_(self)
+        self.menu.addItem_(item_quit)
+
+    def selectAutoTrack_(self, sender):
+        self.pinned_convo_id = None
+        self.refreshData()
+
+    def selectConvo_(self, sender):
+        cid = sender.representedObject()
+        self.pinned_convo_id = cid
+        self.refreshData()
+
+    def copyConvoId_(self, sender):
+        if self.current_stats and "convo_id" in self.current_stats:
+            pb = NSPasteboard.generalPasteboard()
+            pb.clearContents()
+            pb.setString_forType_(self.current_stats["convo_id"], NSPasteboardTypeString)
+
+    def openFinder_(self, sender):
+        if self.current_stats and "file" in self.current_stats:
+            folder = os.path.dirname(self.current_stats["file"])
+            NSWorkspace.sharedWorkspace().openFile_(folder)
+
+    def manualRefresh_(self, sender):
+        self.refreshData()
+
+    def terminateApp_(self, sender):
+        NSApp.terminate_(self)
+
+def main():
+    parser = argparse.ArgumentParser(description="agy-menubar: macOS Menu Bar Monitor for Antigravity")
+    parser.add_argument("--version", "-v", action="version", version=f"agy-menubar {__version__}")
+    parser.parse_args()
+
+    app = NSApplication.sharedApplication()
+    delegate = AntigravityMenuBarApp.alloc().init()
+    app.setDelegate_(delegate)
+    app.run()
+
+if __name__ == "__main__":
+    main()
