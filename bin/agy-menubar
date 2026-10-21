@@ -44,7 +44,7 @@ from AppKit import (
     NSPasteboardTypeString
 )
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 DB_PATH = os.path.expanduser("~/.gemini/antigravity/conversation_summaries.db")
 BRAIN_DIR = os.path.expanduser("~/.gemini/antigravity/brain")
@@ -673,6 +673,12 @@ class AntigravityMenuBarApp(NSObject):
         self.refreshData(force=True, rebuild_menu_now=True)
 
     def terminateApp_(self, sender):
+        if self.timer:
+            self.timer.invalidate()
+            self.timer = None
+        if self.status_item:
+            NSStatusBar.systemStatusBar().removeStatusItem_(self.status_item)
+            self.status_item = None
         NSApp.terminate_(self)
 
 

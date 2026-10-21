@@ -96,7 +96,10 @@ else
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>StandardOutPath</key>
     <string>/tmp/agy-menubar.log</string>
     <key>StandardErrorPath</key>
